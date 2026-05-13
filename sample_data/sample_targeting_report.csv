@@ -1,0 +1,7 @@
+Campaign Name,Ad Group Name,Targeting,Keyword,Match Type,Impressions,Click,Cost,14 Day Total Sales,14 Day Total Orders,Advertised ASIN,Purchased ASIN,Budget
+SP - Shoes - Auto,Auto Group,auto-close-match,auto-close-match,Auto,4200,42,40,80,2,B0SAMPLE01,B0SAMPLE01,50
+SP - Shoes - Auto,Auto Group,auto-loose-match,auto-loose-match,Auto,3000,30,28,0,0,B0SAMPLE01,,50
+SP - Shoes - Manual,Exact Winners,trail running shoes men,trail running shoes men,Exact,1100,44,22,220,8,B0SAMPLE01,B0SAMPLE01,80
+SP - Shoes - Manual,Exact Winners,lightweight running shoes,lightweight running shoes,Exact,900,30,55,70,1,B0SAMPLE01,B0SAMPLE02,80
+SP - Shoes - Research,Broad Test,waterproof hiking boots,waterproof hiking boots,Broad,7000,6,5,0,0,B0SAMPLE03,,35
+SP - Socks - Manual,Socks Exact,running socks,running socks,Exact,600,21,8,84,5,B0SAMPLE04,B0SAMPLE04,25
