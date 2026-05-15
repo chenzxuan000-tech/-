@@ -34,9 +34,11 @@ def build_excel_report(
     account_data: pd.DataFrame,
     priority_list: pd.DataFrame,
     aggregations: Optional[dict[str, pd.DataFrame]] = None,
+    action_pivots: Optional[dict[str, pd.DataFrame]] = None,
 ) -> bytes:
     output = BytesIO()
     aggregations = aggregations or {}
+    action_pivots = action_pivots or {}
 
     sheet_frames = {
         "账户总览": overview,
@@ -49,8 +51,11 @@ def build_excel_report(
         "账户总数据明细": account_data,
         "优先级清单": priority_list,
     }
+    for sheet_name, dataframe in action_pivots.items():
+        sheet_frames[_safe_sheet_name(sheet_name)] = dataframe
     for dimension_name, dataframe in aggregations.items():
-        sheet_frames[_safe_sheet_name(f"{dimension_name}聚合")] = dataframe
+        sheet_name = dimension_name if str(dimension_name).startswith("透视-") else f"{dimension_name}聚合"
+        sheet_frames[_safe_sheet_name(sheet_name)] = dataframe
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for sheet_name, dataframe in sheet_frames.items():
@@ -119,7 +124,7 @@ def _format_worksheet(worksheet, dataframe: pd.DataFrame) -> None:
         if number_format:
             for cell in worksheet[letter][1:]:
                 cell.number_format = number_format
-                if column_name in {"CTR", "CVR", "ACOS", "ROAS", "Spend", "Sales", "CPC", "Budget", "优先级评分"}:
+                if column_name in {"CTR", "CVR", "ACOS", "ROAS", "Spend", "Sales", "CPC", "Budget", "优先级评分", "最高优先级评分"} or column_name.endswith("数"):
                     alignment = copy(cell.alignment)
                     alignment.horizontal = "right"
                     cell.alignment = alignment
@@ -196,7 +201,7 @@ def _number_format_for(column_name: str) -> Optional[str]:
         return "0.00"
     if column_name in {"Impressions", "Clicks", "Orders", "总曝光", "总点击", "总订单"}:
         return "#,##0"
-    if column_name == "优先级评分":
+    if column_name in {"优先级评分", "最高优先级评分"} or column_name.endswith("数"):
         return "0"
     return None
 
@@ -216,5 +221,11 @@ def _apply_tab_color(worksheet) -> None:
         "精准投放机会": "00A6A6",
         "账户总数据明细": "7F7F7F",
         "优先级清单": "FFC000",
+        "透视-广告活动": "2F5597",
+        "透视-广告活动 × 广告组": "2F5597",
+        "透视-搜索词": "00A6A6",
+        "透视-Targeting": "00A6A6",
+        "透视-建议动作": "70AD47",
+        "透视-优先级": "FFC000",
     }
     worksheet.sheet_properties.tabColor = colors.get(worksheet.title, "9EADBA")

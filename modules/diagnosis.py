@@ -160,6 +160,7 @@ def run_diagnosis(
     action_df = pd.DataFrame(actions)
     action_df = _deduplicate_actions(action_df)
     action_df["优先级评分"] = action_df.apply(lambda row: _priority_score(row, config), axis=1)
+    action_df["优先级"] = action_df.apply(lambda row: _priority_label(row, config), axis=1)
     action_df["动作排序"] = action_df["建议动作"].map(ACTION_RANK).fillna(99)
     action_df["优先级排序"] = action_df["优先级"].map(PRIORITY_RANK).fillna(3)
     action_df = action_df.sort_values(
@@ -700,7 +701,6 @@ def _deduplicate_actions(actions: pd.DataFrame) -> pd.DataFrame:
 
 
 def _priority_score(row: pd.Series, config: DiagnosisConfig) -> int:
-    priority = _text(row, "优先级")
     action = _text(row, "建议动作")
     rule = _text(row, "诊断规则")
     spend = _value(row, CANONICAL_FIELDS["spend"])
@@ -709,25 +709,68 @@ def _priority_score(row: pd.Series, config: DiagnosisConfig) -> int:
     sales = _value(row, CANONICAL_FIELDS["sales"])
     acos = _value(row, "ACOS")
     impressions = _value(row, CANONICAL_FIELDS["impressions"])
+    cvr = _value(row, "CVR")
 
-    score = {"高": 78, "中": 55, "低": 30}.get(priority, 25)
-    score += min(spend / max(config.min_waste_spend, 1) * 4, 16)
-    score += min(clicks / max(config.min_waste_clicks, 1) * 3, 12)
+    score = 18
+    score += min(spend / max(config.min_waste_spend, 1) * 8, 34)
+    score += min(clicks / max(config.min_waste_clicks, 1) * 6, 24)
 
     if action in {"暂停", "否定精准", "否定词组"}:
-        score += 8
+        score += 14
+        if orders == 0:
+            score += 10
+        if spend >= config.min_waste_spend * 3 or clicks >= config.hard_waste_clicks:
+            score += 8
     if action == "降低竞价" and orders >= 1 and acos > config.target_acos:
-        score += min((acos / max(config.target_acos, 0.01) - 1) * 8, 12)
+        score += 10
+        score += min((acos / max(config.target_acos, 0.01) - 1) * 10, 18)
     if action in {"提高竞价", "增加预算", "提取精准投放"}:
-        score += min(orders * 4, 14)
+        score += min(orders * 5, 18)
         if sales > 0 and 0 < acos <= config.target_acos * config.low_acos_multiplier:
             score += 8
     if "低 CTR 高曝光" in rule:
         score += min(impressions / max(config.high_impressions, 1) * 4, 10)
+    if "高 CTR 低 CVR" in rule and cvr < config.low_cvr:
+        score += 8
     if action == "继续观察":
-        score -= 8
+        score -= 24
 
     return int(max(0, min(round(score), 100)))
+
+
+def _priority_label(row: pd.Series, config: DiagnosisConfig) -> str:
+    action = _text(row, "建议动作")
+    rule = _text(row, "诊断规则")
+    score = _value(row, "优先级评分")
+    spend = _value(row, CANONICAL_FIELDS["spend"])
+    clicks = _value(row, CANONICAL_FIELDS["clicks"])
+    orders = _value(row, CANONICAL_FIELDS["orders"])
+    acos = _value(row, "ACOS")
+
+    if action == "继续观察":
+        return "低"
+    if action in {"提高竞价", "增加预算", "提取精准投放"}:
+        return "中" if score >= 58 else "低"
+
+    severe_no_order = (
+        orders == 0
+        and (spend >= config.min_waste_spend * 3 or clicks >= config.hard_waste_clicks)
+    )
+    severe_acos = orders >= 1 and acos >= config.target_acos * 1.8 and spend >= config.min_waste_spend * 2
+
+    if action == "暂停" and severe_no_order:
+        return "高"
+    if action in {"否定精准", "否定词组"} and severe_no_order:
+        return "高"
+    if action == "降低竞价" and severe_acos:
+        return "高"
+    if "高 CTR 低 CVR" in rule and clicks >= config.hard_waste_clicks * 2 and orders == 0:
+        return "高"
+    if score >= 85:
+        return "高"
+    if score >= 58:
+        return "中"
+    return "低"
 
 
 def _action_mask(actions: pd.DataFrame, expected_actions: set[str]) -> pd.Series:

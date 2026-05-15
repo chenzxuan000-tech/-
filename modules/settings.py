@@ -8,6 +8,7 @@ from modules.diagnosis import DiagnosisConfig
 @dataclass(frozen=True)
 class AppSettings:
     mode: str
+    rule_preset: str
     manual_mapping_enabled: bool
     ai_report_enabled: bool
     diagnosis_config: DiagnosisConfig

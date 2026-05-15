@@ -52,6 +52,33 @@ h1, h2, h3, h4, p, label {
     color: #101828 !important;
 }
 
+.sidebar-rule-card {
+    display: grid;
+    gap: 8px;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 12px;
+    padding: 12px;
+    margin: 8px 0 14px;
+}
+
+.sidebar-rule-card div {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: center;
+}
+
+.sidebar-rule-card span {
+    color: rgba(255, 255, 255, 0.74) !important;
+    font-size: 12px;
+}
+
+.sidebar-rule-card b {
+    color: #FFFFFF !important;
+    font-size: 13px;
+}
+
 [data-testid="stSidebar"] section[data-testid="stFileUploaderDropzone"] {
     background: rgba(255, 255, 255, 0.08);
     border: 1px dashed rgba(255, 255, 255, 0.45);
@@ -192,6 +219,36 @@ h1, h2, h3, h4, p, label {
 [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button:last-of-type::after,
 [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button:last-of-type span::after {
     color: #123D3A !important;
+}
+
+/* Keep the uploader quiet: Streamlit renders bilingual helper text inside the
+   dropzone, so hide native copy and use our two pseudo-element labels only. */
+[data-testid="stSidebar"] section[data-testid="stFileUploaderDropzone"] {
+    min-height: 156px;
+    padding: 0 !important;
+}
+
+[data-testid="stSidebar"] section[data-testid="stFileUploaderDropzone"] * {
+    opacity: 0 !important;
+    visibility: hidden !important;
+}
+
+[data-testid="stSidebar"] section[data-testid="stFileUploaderDropzone"] button:first-of-type {
+    display: block !important;
+    visibility: visible !important;
+    opacity: 0 !important;
+}
+
+[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"]::before {
+    top: 42px;
+    z-index: 2;
+    font-size: 16px;
+}
+
+[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"]::after {
+    top: 76px;
+    z-index: 2;
+    font-size: 13px;
 }
 
 [data-testid="stTabs"] [role="tablist"] {
@@ -522,6 +579,35 @@ h1, h2, h3, h4, p, label {
     white-space: pre-wrap;
 }
 
+.ai-report-paragraph {
+    color: #1D2939;
+    font-size: 16px;
+    line-height: 1.8;
+    margin: 0 0 12px;
+    max-width: 1120px;
+}
+
+.ai-report-list-title {
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 800;
+    margin: 18px 0 8px;
+}
+
+.ai-report-item {
+    background: #F9FAFB;
+    border: 1px solid #EAECF0;
+    border-left: 4px solid var(--primary-2);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin: 0 0 8px;
+    color: #1D2939;
+    font-size: 15px;
+    line-height: 1.65;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+
 .empty-card {
     text-align: center;
     padding: 54px 30px;
@@ -592,6 +678,18 @@ button span {
 }
 
 [data-testid="stToolbar"] {
+    display: none !important;
+}
+
+/* Streamlit adds copyable anchor links to headings; hide the icon-like affordance. */
+[data-testid="stMarkdownContainer"] h1 a,
+[data-testid="stMarkdownContainer"] h2 a,
+[data-testid="stMarkdownContainer"] h3 a,
+[data-testid="stMarkdownContainer"] h4 a,
+[data-testid="stMarkdownContainer"] h5 a,
+[data-testid="stMarkdownContainer"] h6 a,
+a.anchor-link,
+a.header-anchor {
     display: none !important;
 }
 

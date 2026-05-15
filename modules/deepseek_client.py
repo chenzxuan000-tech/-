@@ -27,6 +27,7 @@ def generate_deepseek_report(
     actions: pd.DataFrame,
     aggregations: dict[str, pd.DataFrame],
     target_acos: float,
+    data_quality_notes: list[str] | None = None,
     timeout: int = 120,
 ) -> DeepSeekResult:
     api_key = api_key.strip()
@@ -36,7 +37,7 @@ def generate_deepseek_report(
     if model not in DEEPSEEK_MODELS:
         return DeepSeekResult(False, "", f"不支持的模型：{model}")
 
-    user_prompt = _build_prompt(overview, actions, aggregations, target_acos)
+    user_prompt = _build_prompt(overview, actions, aggregations, target_acos, data_quality_notes)
 
     payload = {
         "model": model,
@@ -45,13 +46,15 @@ def generate_deepseek_report(
                 "role": "system",
                 "content": (
                     "你是资深亚马逊广告顾问。请基于用户提供的结构化广告诊断数据，"
-                    "输出中文、专业、可执行的广告优化报告。不要编造未提供的数据。"
+                    "输出中文、专业、可执行的广告优化报告。必须严格遵守事实边界，"
+                    "不要编造未提供的数据、日期、报表周期、产品信息或后台故障。"
+                    "不要寒暄，不要重复标题，直接输出结构化结论。"
                 ),
             },
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.3,
-        "max_tokens": 2048,
+        "max_tokens": 1400,
         "stream": False,
     }
 
@@ -117,9 +120,12 @@ def _build_prompt(
     actions: pd.DataFrame,
     aggregations: dict[str, pd.DataFrame],
     target_acos: float,
+    data_quality_notes: list[str] | None = None,
 ) -> str:
     context = {
         "目标 ACOS": format_percent(target_acos),
+        "报表周期": "用户未提供，禁止编造具体日期或日期范围",
+        "数据质量提醒": data_quality_notes or [],
         "账户总览": _overview_payload(overview),
         "高优先级动作 Top 15": _records(actions, 15),
         "广告活动 Top 10": _records(aggregations.get("广告活动", pd.DataFrame()), 10),
@@ -128,6 +134,15 @@ def _build_prompt(
     }
     return (
         "请基于以下 Amazon Ads 诊断数据，生成一份专业广告顾问报告。\n"
+        "硬性约束：\n"
+        "1. 所有数字只能来自下方 JSON，不得自行计算不存在的字段或编造后台数据。\n"
+        "2. 报表周期未知，禁止写具体报告日期、近几天、上周、本月等时间判断。\n"
+        "3. 如果销售额或订单为 0，只能表述为“上传数据口径显示为 0”；不得直接断言追踪代码故障、Listing 致命问题或广告系统故障。\n"
+        "4. 对 Listing、投放匹配、追踪异常等原因只能作为假设，并标注高/中/低可能性及依据。\n"
+        "5. 缺少字段或数据质量提醒中的问题必须先提示，再给行动建议。\n"
+        "6. 如果某项结论缺少数据支持，请写“当前数据不足以判断”，不要补故事。\n\n"
+        "输出格式：不要寒暄；不要写“好的/收到”；不要重复报告标题；总长度控制在 900-1400 个中文字符。"
+        "每个章节最多 2-3 条要点，优先用短句和项目符号。\n\n"
         "报告必须包含：1. 账户整体判断；2. 最大问题；3. 浪费花费分析；"
         "4. 转化效率分析；5. 流量质量分析；6. 关键词/Targeting 机会；"
         "7. 广告活动结构问题；8. 未来 7 天行动计划；9. 预期改善效果。\n"

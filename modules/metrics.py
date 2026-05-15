@@ -39,7 +39,7 @@ def add_metrics(df: pd.DataFrame) -> pd.DataFrame:
     enriched["CTR"] = _safe_divide(clicks, impressions)
     enriched["CPC"] = _safe_divide(spend, clicks)
     enriched["CVR"] = _safe_divide(orders, clicks)
-    enriched["ACOS"] = _safe_divide(spend, sales)
+    enriched["ACOS"] = _safe_divide(spend, sales, infinite_when_numerator=True)
     enriched["ROAS"] = _safe_divide(sales, spend)
     return enriched
 
@@ -60,7 +60,7 @@ def calculate_account_overview(df: pd.DataFrame) -> dict[str, float]:
         "CTR": _safe_scalar_divide(clicks, impressions),
         "CPC": _safe_scalar_divide(spend, clicks),
         "CVR": _safe_scalar_divide(orders, clicks),
-        "ACOS": _safe_scalar_divide(spend, sales),
+        "ACOS": _safe_scalar_divide(spend, sales, infinite_when_numerator=True),
         "ROAS": _safe_scalar_divide(sales, spend),
     }
 
@@ -83,18 +83,31 @@ def overview_dataframe(overview: dict[str, float]) -> pd.DataFrame:
 
 
 def format_percent(value: float) -> str:
-    if pd.isna(value) or np.isinf(value):
+    if pd.isna(value):
         return "0.00%"
+    if np.isinf(value):
+        return "∞"
     return f"{value:.2%}"
 
 
-def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
-    result = numerator.astype(float).divide(denominator.astype(float).replace(0, np.nan))
+def _safe_divide(
+    numerator: pd.Series,
+    denominator: pd.Series,
+    infinite_when_numerator: bool = False,
+) -> pd.Series:
+    numerator_float = numerator.astype(float)
+    denominator_float = denominator.astype(float)
+    result = numerator_float.divide(denominator_float.replace(0, np.nan))
+    if infinite_when_numerator:
+        result = result.mask((denominator_float == 0) & (numerator_float > 0), np.inf)
+        return result.replace([-np.inf], np.nan).fillna(0)
     return result.replace([np.inf, -np.inf], np.nan).fillna(0)
 
 
-def _safe_scalar_divide(numerator: float, denominator: float) -> float:
+def _safe_scalar_divide(numerator: float, denominator: float, infinite_when_numerator: bool = False) -> float:
     if denominator == 0:
+        if infinite_when_numerator and numerator > 0:
+            return float("inf")
         return 0.0
     return numerator / denominator
 
