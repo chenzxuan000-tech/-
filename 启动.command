@@ -41,11 +41,11 @@ fi
 echo ""
 echo "================================================"
 echo "  🚀 启动中，浏览器将自动打开..."
-echo "  如未打开，访问: http://localhost:8501"
+echo "  如未打开，访问: http://localhost:8502"
 echo "  按 Ctrl+C 停止"
 echo "================================================"
 echo ""
 
 sleep 1
-open http://localhost:8501 2>/dev/null || true
-streamlit run app.py --server.headless true --browser.gatherUsageStats false
+open http://localhost:8502 2>/dev/null || true
+streamlit run app.py --server.port 8502 --server.headless true --browser.gatherUsageStats false

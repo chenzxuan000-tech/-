@@ -10,7 +10,7 @@ from modules.metrics import format_percent
 
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_MODELS = ["deepseek-chat", "deepseek-reasoner"]
+DEEPSEEK_MODELS = ["deepseek-v4-pro", "deepseek-v4-flash"]
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,7 @@ class DeepSeekResult:
     ok: bool
     content: str
     error: str = ""
+    finish_reason: str = ""
 
 
 def generate_deepseek_report(
@@ -54,7 +55,7 @@ def generate_deepseek_report(
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.3,
-        "max_tokens": 1400,
+        "max_tokens": 3600,
         "stream": False,
     }
 
@@ -92,17 +93,14 @@ def generate_deepseek_report(
     except ValueError:
         return DeepSeekResult(False, "", f"API 返回非 JSON 数据（前300字符）：{resp.text[:300]}")
 
-    content = (
-        body.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-        .strip()
-    )
+    choice = body.get("choices", [{}])[0]
+    content = choice.get("message", {}).get("content", "").strip()
+    finish_reason = str(choice.get("finish_reason", ""))
     if not content:
         # Show raw response for debugging
-        finish_reason = body.get("choices", [{}])[0].get("finish_reason", "unknown")
+        finish_reason = choice.get("finish_reason", "unknown")
         return DeepSeekResult(False, "", f"DeepSeek 返回空内容。finish_reason={finish_reason}，raw={json.dumps(body, ensure_ascii=False)[:400]}")
-    return DeepSeekResult(True, content)
+    return DeepSeekResult(True, content, finish_reason=finish_reason)
 
 
 def deepseek_report_to_dataframe(content: str, model: str) -> pd.DataFrame:
@@ -127,10 +125,10 @@ def _build_prompt(
         "报表周期": "用户未提供，禁止编造具体日期或日期范围",
         "数据质量提醒": data_quality_notes or [],
         "账户总览": _overview_payload(overview),
-        "高优先级动作 Top 15": _records(actions, 15),
-        "广告活动 Top 10": _records(aggregations.get("广告活动", pd.DataFrame()), 10),
-        "搜索词 Top 20": _records(aggregations.get("搜索词", pd.DataFrame()), 20),
-        "ASIN Top 10": _records(aggregations.get("ASIN", pd.DataFrame()), 10),
+        "高优先级动作 Top 25": _records(actions, 25),
+        "广告活动 Top 15": _records(aggregations.get("广告活动", pd.DataFrame()), 15),
+        "搜索词 Top 30": _records(aggregations.get("搜索词", pd.DataFrame()), 30),
+        "ASIN Top 15": _records(aggregations.get("ASIN", pd.DataFrame()), 15),
     }
     return (
         "请基于以下 Amazon Ads 诊断数据，生成一份专业广告顾问报告。\n"
@@ -141,8 +139,9 @@ def _build_prompt(
         "4. 对 Listing、投放匹配、追踪异常等原因只能作为假设，并标注高/中/低可能性及依据。\n"
         "5. 缺少字段或数据质量提醒中的问题必须先提示，再给行动建议。\n"
         "6. 如果某项结论缺少数据支持，请写“当前数据不足以判断”，不要补故事。\n\n"
-        "输出格式：不要寒暄；不要写“好的/收到”；不要重复报告标题；总长度控制在 900-1400 个中文字符。"
-        "每个章节最多 2-3 条要点，优先用短句和项目符号。\n\n"
+        "输出格式：不要寒暄；不要写“好的/收到”；不要重复报告标题。"
+        "请输出完整复核报告，总长度控制在 2200-3200 个中文字符。"
+        "每个章节 3-5 条要点，优先用短句和项目符号；关键结论必须附带数据依据。\n\n"
         "报告必须包含：1. 账户整体判断；2. 最大问题；3. 浪费花费分析；"
         "4. 转化效率分析；5. 流量质量分析；6. 关键词/Targeting 机会；"
         "7. 广告活动结构问题；8. 未来 7 天行动计划；9. 预期改善效果。\n"

@@ -18,6 +18,6 @@ if [ ! -f ".venv/.installed" ]; then
 fi
 
 echo ">>> 启动亚马逊广告诊断工具..."
-echo "    浏览器打开 http://localhost:8501"
+echo "    浏览器打开 http://localhost:8502"
 echo ""
-streamlit run app.py --server.headless true --browser.gatherUsageStats false
+streamlit run app.py --server.port 8502 --server.headless true --browser.gatherUsageStats false

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -26,7 +27,8 @@ from modules.diagnosis import (
 from modules.exporter import build_excel_report
 from modules.field_mapping import CANONICAL_FIELDS, apply_field_mapping, mapping_results, mapping_results_dataframe
 from modules.field_mapping import infer_report_type, missing_required_fields
-from modules.metrics import add_metrics, calculate_account_overview, overview_dataframe
+from modules.metrics import add_metrics, calculate_account_overview, format_percent, overview_dataframe
+from modules.pivot import ACTION_PIVOT_PRESETS, build_action_pivot, build_export_pivots
 from modules.settings import AppSettings
 
 
@@ -85,6 +87,8 @@ class AnalysisState:
     cleaned_data: pd.DataFrame
     enriched_data: pd.DataFrame
     aggregations: dict[str, pd.DataFrame]
+    data_quality_notes: list[str]
+    action_pivots: dict[str, pd.DataFrame]
     overview: dict[str, float]
     overview_df: pd.DataFrame
     actions: pd.DataFrame
@@ -105,9 +109,20 @@ def main() -> None:
     signature = file_signature(uploaded_files)
     if st.session_state.get("active_file_signature") != signature:
         st.session_state.pop("analysis_state", None)
+        clear_cached_exports()
         st.session_state["active_file_signature"] = signature
 
-    loaded_reports, file_summaries = load_reports(uploaded_files)
+    cached_state = st.session_state.get("analysis_state")
+    should_load_reports = bool(uploaded_files) and (
+        start_clicked
+        or cached_state is None
+        or settings.manual_mapping_enabled
+    )
+    if should_load_reports:
+        loaded_reports, file_summaries = load_reports(uploaded_files)
+    else:
+        loaded_reports = []
+        file_summaries = cached_state.file_summaries if cached_state is not None else []
     manual_mappings = render_manual_mapping_controls(loaded_reports, settings.manual_mapping_enabled)
 
     render_hero(settings, len(uploaded_files))
@@ -126,7 +141,9 @@ def main() -> None:
             render_upload_status(file_summaries)
             st.error("没有可分析的有效文件，请检查上传文件。")
             return
+        clear_cached_exports()
         with st.spinner("正在识别字段、计算指标并生成诊断..."):
+            reset_report_view_state()
             st.session_state["analysis_state"] = build_analysis_state(
                 settings=settings,
                 uploaded_files=uploaded_files,
@@ -142,70 +159,182 @@ def main() -> None:
 def render_sidebar_controls() -> tuple[AppSettings, list[Any], bool]:
     default = DiagnosisConfig()
     with st.sidebar:
-        st.markdown("## 控制中心")
-        st.caption("支持本地无网运行")
-
-        mode = "完整版"
-        target_acos_percent = st.number_input("目标 ACOS（%）", 1.0, 300.0, 30.0, 1.0)
-        min_waste_clicks = st.number_input("最低点击阈值", 1, 200, default.min_waste_clicks, 1)
-        min_waste_spend = st.number_input("最低花费阈值", 0.0, 10000.0, default.min_waste_spend, 1.0)
-
-        with st.expander("高级阈值", expanded=False):
-            hard_waste_clicks = st.number_input("高点击无转化阈值", 1, 300, default.hard_waste_clicks, 1)
-            high_acos_multiplier = st.number_input("高 ACOS 倍数", 1.0, 10.0, default.high_acos_multiplier, 0.05)
-            low_acos_multiplier = st.number_input("低 ACOS 倍数", 0.05, 1.0, default.low_acos_multiplier, 0.05)
-            min_quality_orders = st.number_input("优质词最低订单", 1, 100, default.min_quality_orders, 1)
-            high_ctr_percent = st.number_input("高 CTR 阈值（%）", 0.01, 100.0, default.high_ctr * 100, 0.1)
-            low_ctr_percent = st.number_input("低 CTR 阈值（%）", 0.01, 100.0, default.low_ctr * 100, 0.05)
-            low_cvr_percent = st.number_input("低 CVR 阈值（%）", 0.01, 100.0, default.low_cvr * 100, 0.5)
-            high_impressions = st.number_input("高曝光阈值", 1, 1_000_000, default.high_impressions, 100)
-            low_impressions = st.number_input("低曝光阈值", 1, 1_000_000, default.low_impressions, 50)
-            min_sales_low_exposure = st.number_input("有销量低曝光销售额阈值", 0.0, 100000.0, default.min_sales_low_exposure, 5.0)
-            budget_pressure_percent = st.number_input("预算压力阈值（%）", 1.0, 100.0, default.budget_pressure_ratio * 100, 1.0)
-            pause_spend_multiplier = st.number_input("暂停花费倍数", 0.1, 20.0, default.pause_spend_multiplier, 0.1)
-            exact_opportunity_orders = st.number_input("精准机会最低订单", 1, 100, default.exact_opportunity_orders, 1)
-
-        manual_mapping_enabled = st.checkbox("启用手动字段映射", value=False)
-        ai_report_enabled = st.checkbox("启用本地 AI 报告模板", value=True)
-
-        st.divider()
-        uploaded_files = st.file_uploader(
-            "上传亚马逊广告报表",
-            type=["csv", "xlsx", "xls"],
-            accept_multiple_files=True,
-            key="amazon_ads_reports",
-            help="支持搜索词报表、定向报表、广告活动报表，以及 Bulk 表格。",
+        st.markdown(
+            """
+            <div class="sidebar-brand">
+                <div class="sidebar-brand-kicker">LOCAL ANALYTICS</div>
+                <div class="sidebar-brand-title">控制中心</div>
+                <div class="sidebar-brand-copy">本地运行 · 表格诊断 · DeepSeek 复核</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        start_clicked = st.button("开始诊断", type="primary", width="stretch")
+
+        with st.expander("诊断设置", expanded=True):
+            mode = st.radio("诊断模式", ["基础版", "完整版"], index=1, horizontal=True)
+            target_acos_percent = st.number_input("目标 ACOS（%）", 1.0, 300.0, 30.0, 1.0)
+            rule_preset = st.selectbox(
+                "诊断口径",
+                ["稳健止损（推荐）", "平衡优化", "积极优化", "自定义高级"],
+                index=0,
+                help="新手建议使用预设口径，只需要确认目标 ACOS；熟练运营可以切到自定义高级。",
+            )
+            config = diagnosis_config_for_preset(rule_preset, target_acos_percent / 100, default)
+            st.caption(rule_preset_caption(rule_preset))
+            if rule_preset != "自定义高级":
+                render_rule_preset_preview(config)
+
+        if rule_preset == "自定义高级":
+            with st.expander("高级阈值", expanded=True):
+                min_waste_clicks = st.number_input("最低点击阈值", 1, 200, config.min_waste_clicks, 1)
+                min_waste_spend = st.number_input("最低花费阈值", 0.0, 10000.0, config.min_waste_spend, 1.0)
+                hard_waste_clicks = st.number_input("高点击无转化阈值", 1, 300, config.hard_waste_clicks, 1)
+                high_acos_multiplier = st.number_input("高 ACOS 倍数", 1.0, 10.0, config.high_acos_multiplier, 0.05)
+                low_acos_multiplier = st.number_input("低 ACOS 倍数", 0.05, 1.0, config.low_acos_multiplier, 0.05)
+                min_quality_orders = st.number_input("优质词最低订单", 1, 100, config.min_quality_orders, 1)
+                high_ctr_percent = st.number_input("高 CTR 阈值（%）", 0.01, 100.0, config.high_ctr * 100, 0.1)
+                low_ctr_percent = st.number_input("低 CTR 阈值（%）", 0.01, 100.0, config.low_ctr * 100, 0.05)
+                low_cvr_percent = st.number_input("低 CVR 阈值（%）", 0.01, 100.0, config.low_cvr * 100, 0.5)
+                high_impressions = st.number_input("高曝光阈值", 1, 1_000_000, config.high_impressions, 100)
+                low_impressions = st.number_input("低曝光阈值", 1, 1_000_000, config.low_impressions, 50)
+                min_sales_low_exposure = st.number_input("有销量低曝光销售额阈值", 0.0, 100000.0, config.min_sales_low_exposure, 5.0)
+                budget_pressure_percent = st.number_input("预算压力阈值（%）", 1.0, 100.0, config.budget_pressure_ratio * 100, 1.0)
+                pause_spend_multiplier = st.number_input("暂停花费倍数", 0.1, 20.0, config.pause_spend_multiplier, 0.1)
+                exact_opportunity_orders = st.number_input("精准机会最低订单", 1, 100, config.exact_opportunity_orders, 1)
+            config = DiagnosisConfig(
+                target_acos=target_acos_percent / 100,
+                min_waste_clicks=int(min_waste_clicks),
+                hard_waste_clicks=int(hard_waste_clicks),
+                min_waste_spend=float(min_waste_spend),
+                high_acos_multiplier=float(high_acos_multiplier),
+                low_acos_multiplier=float(low_acos_multiplier),
+                min_quality_orders=int(min_quality_orders),
+                high_ctr=high_ctr_percent / 100,
+                low_ctr=low_ctr_percent / 100,
+                low_cvr=low_cvr_percent / 100,
+                high_impressions=int(high_impressions),
+                low_impressions=int(low_impressions),
+                min_sales_low_exposure=float(min_sales_low_exposure),
+                budget_pressure_ratio=budget_pressure_percent / 100,
+                pause_spend_multiplier=float(pause_spend_multiplier),
+                exact_opportunity_orders=int(exact_opportunity_orders),
+            )
+
+        with st.expander("上传与运行", expanded=True):
+            uploaded_files = st.file_uploader(
+                "上传亚马逊广告报表",
+                type=["csv", "xlsx", "xls"],
+                accept_multiple_files=True,
+                key="amazon_ads_reports",
+                help="支持搜索词报表、定向报表、广告活动报表，以及 Bulk 表格。",
+            )
+            start_clicked = st.button("开始诊断", type="primary", width="stretch")
+
+        with st.expander("高级选项", expanded=False):
+            manual_mapping_enabled = st.checkbox("启用手动字段映射", value=False)
+            ai_report_enabled = st.checkbox("启用本地 AI 报告模板", value=True)
 
         if "analysis_state" in st.session_state:
-            st.divider()
-            st.markdown("### 导出")
-            render_excel_download(st.session_state["analysis_state"], key="sidebar_export")
+            with st.expander("快捷导出", expanded=False):
+                render_excel_download(st.session_state["analysis_state"], key="sidebar_export")
 
-    config = DiagnosisConfig(
-        target_acos=target_acos_percent / 100,
-        min_waste_clicks=int(min_waste_clicks),
-        hard_waste_clicks=int(hard_waste_clicks),
-        min_waste_spend=float(min_waste_spend),
-        high_acos_multiplier=float(high_acos_multiplier),
-        low_acos_multiplier=float(low_acos_multiplier),
-        min_quality_orders=int(min_quality_orders),
-        high_ctr=high_ctr_percent / 100,
-        low_ctr=low_ctr_percent / 100,
-        low_cvr=low_cvr_percent / 100,
-        high_impressions=int(high_impressions),
-        low_impressions=int(low_impressions),
-        min_sales_low_exposure=float(min_sales_low_exposure),
-        budget_pressure_ratio=budget_pressure_percent / 100,
-        pause_spend_multiplier=float(pause_spend_multiplier),
-        exact_opportunity_orders=int(exact_opportunity_orders),
-    )
     return (
-        AppSettings(mode, manual_mapping_enabled, ai_report_enabled, config),
+        AppSettings(mode, rule_preset, manual_mapping_enabled, ai_report_enabled, config),
         uploaded_files or [],
         start_clicked,
     )
+
+
+def diagnosis_config_for_preset(rule_preset: str, target_acos: float, default: DiagnosisConfig) -> DiagnosisConfig:
+    values = {
+        "target_acos": target_acos,
+        "min_waste_clicks": default.min_waste_clicks,
+        "hard_waste_clicks": default.hard_waste_clicks,
+        "min_waste_spend": default.min_waste_spend,
+        "high_acos_multiplier": default.high_acos_multiplier,
+        "low_acos_multiplier": default.low_acos_multiplier,
+        "min_quality_orders": default.min_quality_orders,
+        "high_ctr": default.high_ctr,
+        "low_ctr": default.low_ctr,
+        "low_cvr": default.low_cvr,
+        "high_impressions": default.high_impressions,
+        "low_impressions": default.low_impressions,
+        "min_sales_low_exposure": default.min_sales_low_exposure,
+        "budget_pressure_ratio": default.budget_pressure_ratio,
+        "pause_spend_multiplier": default.pause_spend_multiplier,
+        "exact_opportunity_orders": default.exact_opportunity_orders,
+    }
+    if rule_preset == "稳健止损（推荐）":
+        values.update(
+            min_waste_clicks=8,
+            hard_waste_clicks=20,
+            min_waste_spend=max(default.min_waste_spend, 8.0),
+            high_acos_multiplier=1.6,
+            low_acos_multiplier=0.65,
+            min_quality_orders=2,
+            low_cvr=0.04,
+            pause_spend_multiplier=3.0,
+            exact_opportunity_orders=2,
+        )
+    elif rule_preset == "平衡优化":
+        values.update(
+            min_waste_clicks=5,
+            hard_waste_clicks=15,
+            min_waste_spend=max(default.min_waste_spend, 5.0),
+            high_acos_multiplier=1.3,
+            low_acos_multiplier=0.7,
+            min_quality_orders=1,
+            pause_spend_multiplier=2.0,
+            exact_opportunity_orders=1,
+        )
+    elif rule_preset == "积极优化":
+        values.update(
+            min_waste_clicks=3,
+            hard_waste_clicks=10,
+            min_waste_spend=max(default.min_waste_spend, 3.0),
+            high_acos_multiplier=1.15,
+            low_acos_multiplier=0.8,
+            min_quality_orders=1,
+            pause_spend_multiplier=1.5,
+            exact_opportunity_orders=1,
+        )
+    return DiagnosisConfig(**values)
+
+
+def rule_preset_caption(rule_preset: str) -> str:
+    captions = {
+        "稳健止损（推荐）": "适合新手和日常巡检：减少误杀，优先找明确浪费。",
+        "平衡优化": "适合常规运营：止损、调价和放量机会同步输出。",
+        "积极优化": "适合成熟运营：更快暴露问题，但需要人工复核后执行。",
+        "自定义高级": "适合熟悉业务阈值的运营，可逐项调整规则参数。",
+    }
+    return captions.get(rule_preset, "")
+
+
+def render_rule_preset_preview(config: DiagnosisConfig) -> None:
+    st.markdown(
+        f"""
+        <div class="sidebar-rule-card">
+            <div><span>低效点击</span><b>≥ {config.min_waste_clicks}</b></div>
+            <div><span>强止损点击</span><b>≥ {config.hard_waste_clicks}</b></div>
+            <div><span>最低花费</span><b>${config.min_waste_spend:,.0f}</b></div>
+            <div><span>高 ACOS</span><b>{config.high_acos_multiplier:.2f} × 目标</b></div>
+            <div><span>优质订单</span><b>≥ {config.min_quality_orders}</b></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def clear_cached_exports() -> None:
+    for key in list(st.session_state.keys()):
+        if str(key).startswith("excel_export_bytes_") or str(key).startswith("excel_export_name_"):
+            st.session_state.pop(key, None)
+
+
+def reset_report_view_state() -> None:
+    for key in ["ai_report_selected_section", "deepseek_report_section"]:
+        st.session_state.pop(key, None)
 
 
 def build_analysis_state(
@@ -219,9 +348,11 @@ def build_analysis_state(
     mapping_df, cleaned_data = prepare_data(loaded_reports, manual_mappings)
     enriched_data = add_metrics(cleaned_data)
     aggregations = build_dimension_aggregations(enriched_data)
+    data_quality_notes = build_data_quality_notes(mapping_df, enriched_data)
     overview = calculate_account_overview(enriched_data)
     actions = run_diagnosis(enriched_data, settings.diagnosis_config, settings.mode)
     summary = summarize_recommendations(actions)
+    action_pivots = build_export_pivots(actions)
     negative_keywords = build_negative_keywords(actions)
     bid_adjustments = build_bid_adjustments(actions)
     pause_list = build_pause_list(actions)
@@ -243,6 +374,8 @@ def build_analysis_state(
         cleaned_data=cleaned_data,
         enriched_data=enriched_data,
         aggregations=aggregations,
+        data_quality_notes=data_quality_notes,
+        action_pivots=action_pivots,
         overview=overview,
         overview_df=overview_dataframe(overview),
         actions=actions,
@@ -261,9 +394,10 @@ def render_hero(settings: AppSettings, uploaded_count: int) -> None:
     st.markdown(
         f"""
         <div class="saas-hero">
-            <div>
+            <div class="hero-main">
+                <div class="hero-kicker">Amazon Ads Diagnostic SaaS</div>
                 <div class="hero-title">亚马逊广告诊断专家版</div>
-                <p class="hero-subtitle">上传亚马逊广告报表，立即获得可执行的优化动作建议。</p>
+                <p class="hero-subtitle">本地解析广告报表，聚合关键指标，输出可执行动作，并支持 DeepSeek 复核。</p>
                 <div class="tag-row">
                     <span class="tag">搜索词</span>
                     <span class="tag">投放定向</span>
@@ -272,9 +406,11 @@ def render_hero(settings: AppSettings, uploaded_count: int) -> None:
                 </div>
             </div>
             <div class="hero-side">
-                <div class="hero-side-row"><span class="side-label">运行环境</span><span class="side-value">支持本地无网运行</span></div>
+                <div class="hero-side-row"><span class="side-label">运行</span><span class="side-value">本地无网</span></div>
+                <div class="hero-side-row"><span class="side-label">模式</span><span class="side-value">{escape_html(settings.mode)}</span></div>
+                <div class="hero-side-row"><span class="side-label">口径</span><span class="side-value">{escape_html(settings.rule_preset)}</span></div>
                 <div class="hero-side-row"><span class="side-label">目标 ACOS</span><span class="side-value">{settings.diagnosis_config.target_acos:.0%}</span></div>
-                <div class="hero-side-row"><span class="side-label">已上传文件</span><span class="side-value">{uploaded_count}</span></div>
+                <div class="hero-side-row"><span class="side-label">文件</span><span class="side-value">{uploaded_count}</span></div>
             </div>
         </div>
         """,
@@ -283,18 +419,35 @@ def render_hero(settings: AppSettings, uploaded_count: int) -> None:
 
 
 def render_dashboard_tabs(state: AnalysisState) -> None:
-    tabs = st.tabs(["总览", "动作建议", "问题诊断", "机会分析", "AI 报告", "导出"])
-    with tabs[0]:
+    tab_options = ["总览", "数据透视", "动作建议", "问题诊断", "机会分析", "AI 报告", "导出"]
+    forced_tab = st.session_state.pop("force_dashboard_tab", None)
+    if forced_tab in tab_options:
+        st.session_state["dashboard_tab"] = forced_tab
+    if st.session_state.get("dashboard_tab") not in tab_options:
+        st.session_state["dashboard_tab"] = tab_options[0]
+
+    selected_tab = st.radio(
+        "页面导航",
+        tab_options,
+        horizontal=True,
+        key="dashboard_tab",
+        label_visibility="collapsed",
+    )
+    st.divider()
+
+    if selected_tab == "总览":
         render_overview_tab(state)
-    with tabs[1]:
+    elif selected_tab == "数据透视":
+        render_pivot_tab(state)
+    elif selected_tab == "动作建议":
         render_actions_tab(state)
-    with tabs[2]:
+    elif selected_tab == "问题诊断":
         render_problems_tab(state)
-    with tabs[3]:
+    elif selected_tab == "机会分析":
         render_opportunities_tab(state)
-    with tabs[4]:
+    elif selected_tab == "AI 报告":
         render_ai_report_tab(state)
-    with tabs[5]:
+    elif selected_tab == "导出":
         render_export_tab(state)
 
 
@@ -306,11 +459,11 @@ def render_overview_tab(state: AnalysisState) -> None:
         ("总花费", f"${overview['总花费']:,.2f}", "需要关注" if overview["总花费"] else "暂无花费", "warning"),
         ("总销售额", f"${overview['总销售额']:,.2f}", "健康" if overview["总销售额"] else "暂无销售", "success" if overview["总销售额"] else "warning"),
         ("总订单", f"{overview['总订单']:,.0f}", "健康" if overview["总订单"] else "需要关注", "success" if overview["总订单"] else "danger"),
-        ("ACOS", f"{overview['ACOS']:.2%}", "高于目标" if overview["ACOS"] > target_acos else "健康", "danger" if overview["ACOS"] > target_acos else "success"),
+        ("ACOS", format_percent(overview["ACOS"]), "高于目标" if overview["ACOS"] > target_acos else "健康", "danger" if overview["ACOS"] > target_acos else "success"),
         ("ROAS", f"{overview['ROAS']:,.2f}", "健康" if overview["ROAS"] >= 1 else "需要关注", "success" if overview["ROAS"] >= 1 else "warning"),
-        ("CTR", f"{overview['CTR']:.2%}", "流量信号", "neutral"),
+        ("CTR", format_percent(overview["CTR"]), "流量信号", "neutral"),
         ("CPC", f"${overview['CPC']:,.2f}", "单次点击成本", "neutral"),
-        ("CVR", f"{overview['CVR']:.2%}", "转化信号", "neutral"),
+        ("CVR", format_percent(overview["CVR"]), "转化信号", "neutral"),
     ]
     for row in chunked(kpis, 4):
         columns = st.columns(4)
@@ -338,8 +491,53 @@ def render_overview_tab(state: AnalysisState) -> None:
     render_upload_status(state.file_summaries)
 
 
+def render_pivot_tab(state: AnalysisState) -> None:
+    render_section_header("数据透视", "按广告活动、广告组、搜索词、Targeting、动作或优先级汇总，便于运营快速定位问题。")
+    if state.actions.empty:
+        st.info("暂无动作建议，无法生成透视表。")
+        return
+
+    c1, c2, c3, c4 = st.columns([1.2, 1.3, 1.5, 1])
+    preset = c1.selectbox("透视维度", list(ACTION_PIVOT_PRESETS.keys()), index=0)
+    priorities = c2.multiselect(
+        "优先级",
+        sorted(state.actions["优先级"].dropna().unique()),
+        default=sorted(state.actions["优先级"].dropna().unique()),
+        key="pivot_priority_filter",
+    )
+    action_types = c3.multiselect(
+        "建议动作",
+        sorted(state.actions["建议动作"].dropna().unique()),
+        default=sorted(state.actions["建议动作"].dropna().unique()),
+        key="pivot_action_filter",
+    )
+    min_clicks = c4.number_input("最低点击", min_value=0, max_value=100000, value=0, step=1, key="pivot_min_clicks_filter")
+
+    filtered = state.actions[
+        state.actions["优先级"].isin(priorities)
+        & state.actions["建议动作"].isin(action_types)
+    ].copy()
+    pivot = build_action_pivot(filtered, ACTION_PIVOT_PRESETS[preset])
+    if min_clicks and "Clicks" in pivot.columns:
+        pivot = pivot[pivot["Clicks"] >= min_clicks]
+
+    sort_options = [column for column in ["高优先级数", "建议数", "Spend", "ACOS", "Orders", "Sales", "Clicks"] if column in pivot.columns]
+    if sort_options:
+        sort_by = st.selectbox("排序指标", sort_options, index=0, key="pivot_sort_by")
+        pivot = pivot.sort_values(sort_by, ascending=False)
+
+    st.markdown('<div class="table-note">透视表优先展示“有多少问题、问题有多严重、消耗了多少钱”，比纯文字报告更适合日常复盘和派单。</div>', unsafe_allow_html=True)
+    st.dataframe(format_pivot_dataframe(pivot.head(200)), width="stretch", hide_index=True, height=520)
+
+    if st.toggle("显示导出透视表预览", value=False):
+        export_pivots = getattr(state, "action_pivots", build_export_pivots(state.actions))
+        for name, dataframe in export_pivots.items():
+            with st.expander(name, expanded=False):
+                st.dataframe(format_pivot_dataframe(dataframe.head(80)), width="stretch", hide_index=True)
+
+
 def render_actions_tab(state: AnalysisState) -> None:
-    render_section_header("动作建议", "优先处理红色高优先级，再处理调价和增长机会。")
+    render_section_header("动作建议", "优先级按浪费金额、点击样本、ACOS 偏离、转化缺口和动作紧急度综合计算。")
     columns = st.columns(4)
     stats = [
         ("高优先级", state.summary["高优先级"], "danger"),
@@ -351,7 +549,7 @@ def render_actions_tab(state: AnalysisState) -> None:
         with column:
             render_stat_card(*stat)
 
-    st.markdown('<div class="table-note">建议先处理高优先级浪费项：暂停、否定、明显高 ACOS；再执行调价和精准提取。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="table-note">高优先级不是“全部都急”，而是满足强止损或高损耗标准；中优先级适合本周处理；低优先级用于观察和放量。</div>', unsafe_allow_html=True)
     filtered = render_action_filters(state.actions)
     if "优先级评分" in filtered.columns:
         filtered = filtered.sort_values("优先级评分", ascending=False)
@@ -391,68 +589,319 @@ def render_opportunities_tab(state: AnalysisState) -> None:
 
 
 def render_ai_report_tab(state: AnalysisState) -> None:
-    render_section_header("AI 报告", "展示本地模板报告，并可选择 DeepSeek 复核。")
-    report_map = {item.get("章节", ""): item.get("报告内容", "") for item in state.ai_report_sections}
-    cards = [
-        ("账户整体表现", "账户整体表现总结", "总"),
-        ("最大问题", "当前最大问题", "重"),
-        ("浪费花费分析", "浪费花费分析", "费"),
-        ("转化效率分析", "转化效率分析", "转"),
-        ("流量质量分析", "流量质量分析", "流"),
-        ("机会分析", "关键词机会分析", "机"),
-        ("广告结构问题", "广告活动结构问题", "构"),
-        ("优先级行动", "优先级行动计划", "先"),
-        ("未来 7 天计划", "未来 7 天优化建议", "周"),
-        ("预期效果", "预期改善效果", "效"),
-    ]
-
-    summary_cols = st.columns(4)
-    summary_items = [
-        ("本地模板", "已生成", "success"),
-        ("DeepSeek 复核", "已生成" if st.session_state.get("deepseek_report") else "未生成", "success" if st.session_state.get("deepseek_report") else "neutral"),
-        ("报告章节", len(cards), "neutral"),
-        ("当前模式", state.settings.mode, "neutral"),
-    ]
-    for column, (label, value, tone) in zip(summary_cols, summary_items):
-        with column:
-            render_stat_card(label, value, tone)
-
-    labels = [title for title, _, _ in cards]
-    default_title = st.session_state.get("ai_report_selected_section", labels[0])
-    if default_title not in labels:
-        default_title = labels[0]
-    selected_title = st.radio(
-        "AI 报告章节",
-        options=labels,
-        index=labels.index(default_title),
-        horizontal=True,
-        key="ai_report_selected_section",
-        label_visibility="collapsed",
+    st.html('<div class="ai-page-anchor"></div>')
+    st.html(
+        """
+        <div class="ai-page-heading">
+            <div class="ai-page-kicker">AI Review Report</div>
+            <h2>AI 报告</h2>
+            <p>展示 DeepSeek 复核生成的广告诊断报告，底部保留重新生成和原文核对入口。</p>
+        </div>
+        """
     )
-    selected_card = next(item for item in cards if item[0] == selected_title)
-    render_report_card(
-        selected_card[0],
-        report_map.get(selected_card[1], ""),
-        selected_card[2],
-    )
-
     render_deepseek_panel(state)
 
-    if st.session_state.get("deepseek_report"):
-        render_deepseek_report_panel(str(st.session_state["deepseek_report"]))
+
+def render_ai_status_summary(state: AnalysisState) -> None:
+    report_ready = bool(st.session_state.get("deepseek_report"))
+    reminders = len(getattr(state, "data_quality_notes", []))
+    finish_reason = str(st.session_state.get("deepseek_finish_reason", "") or "")
+    model = str(st.session_state.get("ds_selected_model", DEEPSEEK_MODELS[0]))
+    status_items = [
+        ("DeepSeek 复核", "已生成" if report_ready else "未生成", "success" if report_ready else "neutral"),
+        ("数据提醒", str(reminders), "warning" if reminders else "neutral"),
+        ("诊断口径", state.settings.rule_preset, "neutral"),
+        ("当前模型", model, "neutral"),
+    ]
+    if finish_reason:
+        status_items[0] = ("DeepSeek 复核", f"已生成 · {finish_reason}", "success")
+    cards = "".join(
+        f'<div class="ai-status-item ai-status-{escape_html(tone)}">'
+        f"<span>{escape_html(label)}</span>"
+        f"<strong>{escape_html(value)}</strong>"
+        "</div>"
+        for label, value, tone in status_items
+    )
+    st.html(f'<div class="ai-status-strip">{cards}</div>')
 
 
-def render_deepseek_report_panel(content: str) -> None:
-    with st.container(border=True):
-        st.subheader("DeepSeek 复核报告")
-        st.markdown(content)
+def render_ai_report_reading_flow(state: AnalysisState, content: str) -> None:
+    sections = split_markdown_sections(clean_deepseek_report(content)) if content else {}
+    render_ai_core_conclusion(state, sections, bool(content))
+    render_ai_metric_section(state)
+    render_ai_problem_section(state, sections)
+    render_ai_action_section(state, sections)
+    render_ai_quality_section(state)
+
+
+def render_ai_core_conclusion(state: AnalysisState, sections: dict[str, str], has_report: bool) -> None:
+    conclusion = build_core_conclusion(state, sections, has_report)
+    target_acos = state.settings.diagnosis_config.target_acos
+    acos = safe_float(state.overview.get("ACOS", 0))
+    tone_label = "需要优先优化" if acos > target_acos else "表现可控"
+    st.html(
+        f"""
+        <section class="ai-report-module ai-core-module">
+            <div class="ai-core-label">核心结论 · 账户整体判断</div>
+            <h3>{escape_html(tone_label)}</h3>
+            <p>{escape_html(conclusion)}</p>
+        </section>
+        """
+    )
+
+
+def render_ai_metric_section(state: AnalysisState) -> None:
+    overview = state.overview
+    target_acos = state.settings.diagnosis_config.target_acos
+    metrics = [
+        ("ROAS", f"{safe_float(overview.get('ROAS')):,.2f}", "广告回报率"),
+        ("ACOS", format_percent(safe_float(overview.get("ACOS"))), f"目标 {format_percent(target_acos)}"),
+        ("点击量", f"{safe_float(overview.get('总点击')):,.0f}", "账户总点击"),
+        ("订单数", f"{safe_float(overview.get('总订单')):,.0f}", "广告归因订单"),
+        ("CTR", format_percent(safe_float(overview.get("CTR"))), "点击效率"),
+        ("CVR", format_percent(safe_float(overview.get("CVR"))), "转化效率"),
+        ("总花费", f"${safe_float(overview.get('总花费')):,.2f}", "广告消耗"),
+        ("销售额", f"${safe_float(overview.get('总销售额')):,.2f}", "广告销售额"),
+    ]
+    metric_cards = "".join(
+        '<div class="ai-metric-card">'
+        f"<span>{escape_html(label)}</span>"
+        f"<strong>{escape_html(value)}</strong>"
+        f"<small>{escape_html(note)}</small>"
+        "</div>"
+        for label, value, note in metrics
+    )
+    st.html(
+        f"""
+        <section class="ai-report-module">
+            <div class="ai-module-heading">
+                <span>关键数据</span>
+                <em>用于判断账户效率和转化质量的核心指标</em>
+            </div>
+            <div class="ai-metric-grid">{metric_cards}</div>
+        </section>
+        """
+    )
+
+
+def render_ai_problem_section(state: AnalysisState, sections: dict[str, str]) -> None:
+    cards = build_problem_cards(state, sections)
+    card_html = "".join(
+        f'<div class="ai-risk-card ai-risk-{escape_html(card["tone"])}">'
+        "<div>"
+        f"<span>{escape_html(card['badge'])}</span>"
+        f"<h4>{escape_html(card['title'])}</h4>"
+        "</div>"
+        f"<p>{escape_html(card['body'])}</p>"
+        "</div>"
+        for card in cards
+    )
+    st.html(
+        f"""
+        <section class="ai-report-module">
+            <div class="ai-module-heading">
+                <span>主要问题</span>
+                <em>先看风险，再决定是否否定、降价、暂停或继续观察</em>
+            </div>
+            <div class="ai-risk-grid">{card_html}</div>
+        </section>
+        """
+    )
+
+
+def render_ai_action_section(state: AnalysisState, sections: dict[str, str]) -> None:
+    actions = build_action_checklist(state, sections)
+    action_html = "".join(
+        '<div class="ai-action-item">'
+        "<span></span>"
+        f"<p>{escape_html(action)}</p>"
+        "</div>"
+        for action in actions
+    )
+    st.html(
+        f"""
+        <section class="ai-report-module">
+            <div class="ai-module-heading">
+                <span>优先动作建议</span>
+                <em>按复核口径从数据确认到投放调整依次执行</em>
+            </div>
+            <div class="ai-action-list">{action_html}</div>
+        </section>
+        """
+    )
+
+
+def render_ai_quality_section(state: AnalysisState) -> None:
+    notes = getattr(state, "data_quality_notes", [])
+    if not notes:
+        return
+    note_html = "".join(f"<li>{escape_html(note)}</li>" for note in notes[:4])
+    st.html(
+        f"""
+        <section class="ai-quality-note">
+            <div class="ai-quality-title">数据质量提醒</div>
+            <ul>{note_html}</ul>
+        </section>
+        """
+    )
+
+
+def build_core_conclusion(state: AnalysisState, sections: dict[str, str], has_report: bool) -> str:
+    if has_report:
+        body = find_section_body(sections, ["账户整体", "整体判断", "核心结论", "最大问题", "复核摘要"])
+        candidate = first_report_sentence(body)
+        if candidate:
+            return candidate
+
+    overview = state.overview
+    target_acos = state.settings.diagnosis_config.target_acos
+    acos = safe_float(overview.get("ACOS"))
+    if not has_report:
+        return "DeepSeek 复核尚未生成。生成后，这里会优先呈现账户结论、关键数据、主要风险和下一步动作。"
+    if acos > target_acos:
+        return (
+            f"当前广告存在较明显的投放效率问题，ACOS {format_percent(acos)} 高于目标 "
+            f"{format_percent(target_acos)}，需要优先排查数据口径与核心活动消耗结构。"
+        )
+    return (
+        f"当前账户整体 ACOS 为 {format_percent(acos)}，未高于目标 {format_percent(target_acos)}，"
+        "建议在保持健康活动预算的同时继续排查局部浪费。"
+    )
+
+
+def build_problem_cards(state: AnalysisState, sections: dict[str, str]) -> list[dict[str, str]]:
+    overview = state.overview
+    target_acos = state.settings.diagnosis_config.target_acos
+    acos = safe_float(overview.get("ACOS"))
+    cards: list[dict[str, str]] = []
+
+    if acos > target_acos:
+        cards.append(
+            {
+                "tone": "high",
+                "badge": "高风险",
+                "title": "ACOS 高于目标",
+                "body": (
+                    f"当前 ACOS {format_percent(acos)}，目标 {format_percent(target_acos)}。"
+                    "建议先处理高花费、高 ACOS 或无转化的消耗来源。"
+                ),
+            }
+        )
+
+    notes = getattr(state, "data_quality_notes", [])
+    if notes:
+        cards.append(
+            {
+                "tone": "amber",
+                "badge": "需复核",
+                "title": "数据存在口径异常",
+                "body": limit_report_text(notes[0], 118),
+            }
+        )
+
+    high_priority = int(safe_float(state.summary.get("高优先级", 0)))
+    if high_priority:
+        cards.append(
+            {
+                "tone": "medium",
+                "badge": "优先处理",
+                "title": "高优先级动作较多",
+                "body": f"当前共有 {high_priority} 条高优先级动作，适合先按花费和风险排序逐项处理。",
+            }
+        )
+
+    listing_count = int(safe_float(state.summary.get("Listing问题", 0)))
+    if listing_count:
+        cards.append(
+            {
+                "tone": "medium",
+                "badge": "承接问题",
+                "title": "Listing 承接需要复查",
+                "body": f"诊断中有 {listing_count} 条建议指向 Listing 检查，需复核主图、标题、价格、评价和详情页承接。",
+            }
+        )
+
+    for item in collect_report_items(sections, ["最大问题", "问题诊断", "广告结构"], 2):
+        if len(cards) >= 4:
+            break
+        cards.append({"tone": "neutral", "badge": "DeepSeek", "title": "复核补充", "body": item})
+
+    if not cards:
+        cards.append(
+            {
+                "tone": "neutral",
+                "badge": "观察",
+                "title": "暂未发现突出风险",
+                "body": "当前规则没有触发明显高风险项，建议继续观察消耗变化并保留表现稳定的活动。",
+            }
+        )
+    return cards[:4]
+
+
+def build_action_checklist(state: AnalysisState, sections: dict[str, str]) -> list[str]:
+    report_actions = collect_report_items(sections, ["未来", "行动", "优先", "建议"], 4)
+    fallback_actions = [
+        "先排查转化延迟和归因窗口，确认销售额与订单是否存在统计滞后。",
+        "核查有花费无销售额、点击有订单为 0 的数据，避免把口径问题误判为后台故障。",
+        "优先处理高花费、高 ACOS 或无转化的广告活动、搜索词和投放定向。",
+        "保留表现优异的品牌词、高 ROAS 活动和低 ACOS 转化来源。",
+        "完成数据复核后，再决定是否执行否定、降价、暂停或预算调整。",
+    ]
+    if int(safe_float(state.summary.get("增长建议", 0))):
+        fallback_actions.append("对低 ACOS 且有订单的对象补充预算或提取精准投放，避免只做止损不做增长。")
+
+    actions: list[str] = []
+    for action in report_actions + fallback_actions:
+        if action and action not in actions:
+            actions.append(action)
+        if len(actions) >= 6:
+            break
+    return actions
+
+
+def find_section_body(sections: dict[str, str], keywords: list[str]) -> str:
+    for title, body in sections.items():
+        if any(keyword in title for keyword in keywords):
+            return body
+    return next(iter(sections.values()), "") if sections else ""
+
+
+def collect_report_items(sections: dict[str, str], keywords: list[str], limit: int) -> list[str]:
+    body = find_section_body(sections, keywords)
+    paragraphs, items = split_report_body(body)
+    candidates = items or paragraphs
+    cleaned: list[str] = []
+    for item in candidates:
+        text = limit_report_text(item, 132)
+        if text and text not in cleaned:
+            cleaned.append(text)
+        if len(cleaned) >= limit:
+            break
+    return cleaned
+
+
+def first_report_sentence(body: str) -> str:
+    paragraphs, items = split_report_body(body)
+    for item in paragraphs + items:
+        text = limit_report_text(item, 176)
+        if text:
+            return text
+    return ""
+
+
+def limit_report_text(text: object, max_chars: int) -> str:
+    cleaned = strip_inline_markdown(str(text or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ；;")
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[:max_chars].rstrip("，,。；; ") + "。"
 
 
 def render_export_tab(state: AnalysisState) -> None:
     render_section_header("导出中心", "下载带格式的完整 Excel 工作簿。")
     with st.container(border=True):
         st.subheader("Excel 报告包")
-        st.caption("包含账户总览、AI 报告、动作建议、否定词、暂停清单、调价清单、精准机会和清洗后明细。")
+        st.caption("包含账户总览、AI 报告、动作建议、透视表、否定词、暂停清单、调价清单、精准机会和清洗后明细。")
         render_excel_download(state, key="main_export")
     with st.expander("字段识别结果", expanded=False):
         st.dataframe(state.mapping_df, width="stretch", hide_index=True)
@@ -473,6 +922,7 @@ def render_deepseek_panel(state: AnalysisState) -> None:
                 state.actions,
                 state.aggregations,
                 state.settings.diagnosis_config.target_acos,
+                getattr(state, "data_quality_notes", []),
                 timeout=120,
             )
         except Exception as exc:
@@ -487,8 +937,10 @@ def render_deepseek_panel(state: AnalysisState) -> None:
         st.session_state.pop("ds_loading", None)
         if result.ok:
             st.session_state["deepseek_report"] = result.content
+            st.session_state["deepseek_finish_reason"] = result.finish_reason
         else:
             st.session_state["deepseek_error"] = result.error
+        st.session_state["force_dashboard_tab"] = "AI 报告"
         st.rerun()
         return
 
@@ -499,38 +951,172 @@ def render_deepseek_panel(state: AnalysisState) -> None:
             st.session_state.pop("deepseek_error", None)
             st.rerun()
 
-    # ━━━ Phase 3: Form (always visible, no expander) ━━━
-    with st.container(border=True):
-        st.subheader("DeepSeek 复核")
-        st.caption("发送账户总览、重点动作和重点聚合数据，不发送全量明细。")
+    content = str(st.session_state.get("deepseek_report", "") or "")
+    if content:
+        render_deepseek_report_content(content)
+    else:
+        render_deepseek_empty_state()
+    render_deepseek_form(state)
+    if content:
+        render_deepseek_raw_panel(content)
+
+
+def render_deepseek_empty_state() -> None:
+    st.html(
+        """
+        <section class="deepseek-empty-state">
+            <div>
+                <span>等待生成</span>
+                <h3>尚未生成 DeepSeek 复核报告</h3>
+                <p>点击下方按钮后，这里会直接展示 AI 生成的完整诊断报告。</p>
+            </div>
+        </section>
+        """
+    )
+
+
+def render_deepseek_report_content(content: str) -> None:
+    sections = split_markdown_sections(clean_deepseek_report(content))
+    if not sections:
+        st.info("DeepSeek 已返回内容，但暂时无法解析为报告章节。可在下方查看完整原文。")
+        return
+
+    section_html = "".join(
+        render_deepseek_section_html(title, body)
+        for title, body in sections.items()
+    )
+    st.html(
+        f"""
+        <section class="deepseek-report-shell">
+            <div class="deepseek-report-heading">
+                <span>DeepSeek 复核报告</span>
+                <p>以下内容来自 DeepSeek 返回结果，已做基础清洗和排版。</p>
+            </div>
+            <div class="deepseek-report-flow">{section_html}</div>
+        </section>
+        """
+    )
+
+
+def render_deepseek_section_html(title: str, body: str) -> str:
+    lines = [line.strip() for line in str(body or "").splitlines()]
+    pieces: list[str] = []
+    list_open = False
+
+    def close_list() -> None:
+        nonlocal list_open
+        if list_open:
+            pieces.append("</ul>")
+            list_open = False
+
+    for raw_line in lines:
+        if not raw_line:
+            close_list()
+            continue
+        if extract_markdown_heading(raw_line):
+            continue
+
+        bullet_match = re.match(r"^(\d+[.、]|[-*•])\s*(.+)$", raw_line)
+        if bullet_match:
+            if not list_open:
+                pieces.append("<ul>")
+                list_open = True
+            pieces.append(f"<li>{escape_html(strip_inline_markdown(bullet_match.group(2)))}</li>")
+            continue
+
+        close_list()
+        pieces.append(f"<p>{escape_html(strip_inline_markdown(raw_line))}</p>")
+
+    close_list()
+    body_html = "".join(pieces) or "<p>暂无内容。</p>"
+    return (
+        '<article class="deepseek-report-section">'
+        f"<h3>{escape_html(clean_section_title(title))}</h3>"
+        f"{body_html}"
+        "</article>"
+    )
+
+
+def render_deepseek_form(state: AnalysisState) -> None:
+    has_report = bool(st.session_state.get("deepseek_report"))
+    stored_key = str(st.session_state.get("ds_api_key", "") or "")
+    current_model = str(st.session_state.get("ds_selected_model", DEEPSEEK_MODELS[0]))
+    if current_model not in DEEPSEEK_MODELS:
+        current_model = DEEPSEEK_MODELS[0]
+
+    st.html(
+        """
+        <section class="ai-settings-intro">
+            <div>
+                <strong>DeepSeek 复核</strong>
+                <span>仅发送账户总览、重点动作、聚合数据和数据质量提醒，不发送全量明细。</span>
+            </div>
+        </section>
+        """
+    )
+
+    with st.expander("AI 复核设置", expanded=True):
+        show_advanced = st.toggle(
+            "显示高级设置",
+            value=not bool(stored_key),
+            key="deepseek_show_advanced",
+            help="高级设置用于修改 DeepSeek 密钥或切换模型；平时只需要重新生成报告。",
+        )
 
         with st.form("deepseek_review_form"):
-            c1, c2 = st.columns([3, 1])
-            api_key = c1.text_input(
-                "DeepSeek 密钥",
-                value=st.session_state.get("ds_api_key", ""),
-                type="password",
-                placeholder="sk-...",
-                key="deepseek_api_key_input",
-            )
-            model = c2.selectbox("模型", DEEPSEEK_MODELS, index=0, key="deepseek_model")
-            submitted = st.form_submit_button("AI 复核并生成报告", type="primary")
+            api_key = stored_key
+            model = current_model
+            if show_advanced:
+                model_index = DEEPSEEK_MODELS.index(current_model) if current_model in DEEPSEEK_MODELS else 0
+                api_key = st.text_input(
+                    "DeepSeek 密钥",
+                    value=stored_key,
+                    type="password",
+                    placeholder="sk-...",
+                    key="deepseek_api_key_input",
+                )
+                model = st.selectbox("模型", DEEPSEEK_MODELS, index=model_index, key="deepseek_model")
+            button_label = "重新生成 AI 报告" if has_report else "生成 AI 报告"
+            submitted = st.form_submit_button(button_label, type="primary", width="stretch")
 
-        if submitted:
-            st.session_state.pop("deepseek_error", None)
-            st.session_state.pop("deepseek_report", None)
-            if not api_key.strip():
-                st.session_state["deepseek_error"] = "请先输入 DeepSeek 密钥。"
-                st.rerun()
-
-            st.session_state["ds_api_key"] = api_key.strip()
-            st.session_state["ds_selected_model"] = model
-            st.session_state["ds_loading"] = True
+    if submitted:
+        st.session_state.pop("deepseek_error", None)
+        st.session_state.pop("deepseek_report", None)
+        st.session_state.pop("deepseek_finish_reason", None)
+        if not api_key.strip():
+            st.session_state["deepseek_error"] = "请先输入 DeepSeek 密钥。"
             st.rerun()
 
-    # ━━━ Show report ━━━
-    if st.session_state.get("deepseek_report"):
-        render_deepseek_report_panel(st.session_state["deepseek_report"])
+        st.session_state["ds_api_key"] = api_key.strip()
+        st.session_state["ds_selected_model"] = model
+        st.session_state["ds_loading"] = True
+        st.session_state["force_dashboard_tab"] = "AI 报告"
+        st.rerun()
+
+
+def render_deepseek_raw_panel(content: str) -> None:
+    with st.expander("查看完整 DeepSeek 原文", expanded=False):
+        finish_reason = st.session_state.get("deepseek_finish_reason", "")
+        meta = f"原文字符数：{len(content):,}"
+        if finish_reason:
+            meta += f" · finish_reason：{finish_reason}"
+        st.caption(meta)
+        st.text_area(
+            "DeepSeek 原始返回内容",
+            value=content,
+            height=420,
+            label_visibility="collapsed",
+            disabled=True,
+            key="deepseek_raw_text",
+        )
+        st.download_button(
+            "下载 DeepSeek 原文",
+            data=content.encode("utf-8"),
+            file_name="deepseek_raw_report.txt",
+            mime="text/plain",
+            key="download_deepseek_raw",
+            width="stretch",
+        )
 
 
 def render_upload_status(file_summaries: list[dict[str, object]]) -> None:
@@ -638,24 +1224,66 @@ def prepare_data(loaded_reports: list[dict[str, object]], manual_mappings: dict[
     return mapping_df, cleaned_data
 
 
+def build_data_quality_notes(mapping_df: pd.DataFrame, enriched_data: pd.DataFrame) -> list[str]:
+    notes: list[str] = []
+    if not mapping_df.empty and {"标准字段", "状态"}.issubset(mapping_df.columns):
+        required_display_fields = {"曝光量", "点击量", "花费", "销售额", "订单量"}
+        mapped_fields = set(
+            mapping_df.loc[mapping_df["状态"].astype(str).str.contains("成功", na=False), "标准字段"].astype(str)
+        )
+        missing_fields = sorted(required_display_fields - mapped_fields)
+        if missing_fields:
+            notes.append("关键字段未完整识别：" + "、".join(missing_fields))
+
+    if enriched_data.empty:
+        notes.append("清洗后没有可分析的数据行")
+        return notes
+
+    spend_no_sales = int(((enriched_data.get("Spend", 0) > 0) & (enriched_data.get("Sales", 0) == 0)).sum())
+    clicks_no_orders = int(((enriched_data.get("Clicks", 0) > 0) & (enriched_data.get("Orders", 0) == 0)).sum())
+    clicks_gt_impressions = int((enriched_data.get("Clicks", 0) > enriched_data.get("Impressions", 0)).sum())
+    revenue_without_spend = int(((enriched_data.get("Spend", 0) == 0) & ((enriched_data.get("Sales", 0) > 0) | (enriched_data.get("Orders", 0) > 0))).sum())
+
+    if spend_no_sales:
+        notes.append(f"{spend_no_sales} 行存在花费但销售额为 0，ACOS 会显示为 ∞，AI 不应推断后台故障")
+    if clicks_no_orders:
+        notes.append(f"{clicks_no_orders} 行存在点击但订单为 0，需要结合转化窗口和报表口径复核")
+    if clicks_gt_impressions:
+        notes.append(f"{clicks_gt_impressions} 行点击量大于曝光量，可能存在字段映射或源报表口径问题")
+    if revenue_without_spend:
+        notes.append(f"{revenue_without_spend} 行存在无花费销售/订单，建议确认是否混入非广告归因数据")
+    return notes
+
+
 def render_excel_download(state: AnalysisState, key: str) -> None:
-    excel_bytes = build_report_bytes(state)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    st.download_button(
-        "下载完整诊断 Excel",
-        data=excel_bytes,
-        file_name=f"amazon_ads_diagnostic_pro_{timestamp}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-        width="stretch",
-        key=key,
-    )
+    bytes_key = f"excel_export_bytes_{key}"
+    name_key = f"excel_export_name_{key}"
+    if st.button("生成完整诊断 Excel", type="primary", width="stretch", key=f"{key}_build"):
+        with st.spinner("正在生成 Excel 工作簿..."):
+            st.session_state[bytes_key] = build_report_bytes(state)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            st.session_state[name_key] = f"amazon_ads_diagnostic_pro_{timestamp}.xlsx"
+
+    if st.session_state.get(bytes_key):
+        st.download_button(
+            "下载完整诊断 Excel",
+            data=st.session_state[bytes_key],
+            file_name=st.session_state.get(name_key, "amazon_ads_diagnostic_pro.xlsx"),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="secondary",
+            width="stretch",
+            key=key,
+        )
 
 
 def build_report_bytes(state: AnalysisState) -> bytes:
     ai_sections = list(state.ai_report_sections)
     if st.session_state.get("deepseek_report") and not any(item["章节"] == "DeepSeek 复核报告" for item in ai_sections):
         ai_sections.append({"章节": "DeepSeek 复核报告", "报告内容": str(st.session_state["deepseek_report"])})
+    export_tables = {
+        **getattr(state, "action_pivots", build_export_pivots(state.actions)),
+        **getattr(state, "aggregations", {}),
+    }
     return build_excel_report(
         state.overview_df,
         report_to_dataframe(ai_sections),
@@ -666,7 +1294,7 @@ def build_report_bytes(state: AnalysisState) -> bytes:
         state.exact_opportunities,
         state.enriched_data,
         state.priority_list,
-        state.aggregations,
+        export_tables,
     )
 
 
@@ -679,10 +1307,13 @@ def render_section_header(title: str, caption: str = "") -> None:
 def render_kpi_card(label: str, value: str, status: str, tone: str) -> None:
     st.markdown(
         f"""
-        <div class="kpi-card">
-            <div class="kpi-label">{escape_html(label)}</div>
+        <div class="kpi-card kpi-{escape_html(tone)}">
+            <div class="kpi-card-top">
+                <div class="kpi-icon">{escape_html(kpi_icon(label))}</div>
+                <div class="kpi-label">{escape_html(label)}</div>
+            </div>
             <div class="kpi-value">{escape_html(value)}</div>
-            {render_status_badge(status, tone)}
+            <div class="kpi-footer">{render_status_badge(status, tone)}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -692,13 +1323,27 @@ def render_kpi_card(label: str, value: str, status: str, tone: str) -> None:
 def render_stat_card(label: str, value: object, tone: str) -> None:
     st.markdown(
         f"""
-        <div class="stat-card">
+        <div class="stat-card stat-{escape_html(tone)}">
             <div class="stat-label">{escape_html(label)}</div>
             <div class="stat-value">{escape_html(value)}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+
+def kpi_icon(label: str) -> str:
+    icons = {
+        "总花费": "$",
+        "总销售额": "¥",
+        "总订单": "#",
+        "ACOS": "%",
+        "ROAS": "R",
+        "CTR": "C",
+        "CPC": "$",
+        "CVR": "%",
+    }
+    return icons.get(label, "•")
 
 
 def render_problem_section(title: str, dataframe: pd.DataFrame, tone: str) -> None:
@@ -721,10 +1366,149 @@ def render_opportunity_section(title: str, dataframe: pd.DataFrame, tone: str) -
             st.dataframe(format_metric_dataframe(dataframe.head(10)), width="stretch", hide_index=True, height=320)
 
 
-def render_report_card(title: str, body: str, icon: str) -> None:
-    with st.container(border=True):
-        st.markdown(f"### {icon} · {title}")
-        st.markdown(body or "暂无内容")
+def render_report_card(title: str, body: str) -> None:
+    with st.container(border=False):
+        st.markdown(f"### {escape_html(title)}")
+        paragraphs, items = split_report_body(body)
+        if not paragraphs and not items:
+            st.info("暂无内容")
+            return
+        for index, paragraph in enumerate(paragraphs):
+            class_name = "ai-report-paragraph ai-report-lead" if index == 0 else "ai-report-paragraph"
+            st.markdown(f'<p class="{class_name}">{escape_html(paragraph)}</p>', unsafe_allow_html=True)
+        if items:
+            st.markdown('<div class="ai-report-list-title">关键要点</div>', unsafe_allow_html=True)
+            for item in items:
+                st.markdown(
+                    f'<div class="ai-report-item ai-report-item-{report_item_tone(item)}">{escape_html(item)}</div>',
+                    unsafe_allow_html=True,
+                )
+
+
+def report_item_tone(item: str) -> str:
+    text = str(item)
+    if any(keyword in text for keyword in ["风险", "浪费", "偏高", "无转化", "为 0", "不足", "失真"]):
+        return "risk"
+    if any(keyword in text for keyword in ["建议", "执行", "优化", "降低", "否定", "暂停", "提取"]):
+        return "action"
+    if any(keyword in text for keyword in ["数据", "花费", "点击", "订单", "ACOS", "ROAS", "CTR", "CVR"]):
+        return "evidence"
+    return "neutral"
+
+
+def split_report_body(body: str) -> tuple[list[str], list[str]]:
+    text = normalize_report_text(body)
+    if not text:
+        return [], []
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    items = []
+    paragraphs = []
+    for line in lines:
+        if extract_markdown_heading(line):
+            continue
+        line = strip_inline_markdown(line)
+        if re.match(r"^(\d+[.、]|[-*•])\s*", line):
+            items.append(re.sub(r"^(\d+[.、]|[-*•])\s*", "", line).strip())
+        elif "；" in line and len(line) > 120:
+            paragraphs.extend([part.strip(" ；。") + "。" for part in line.split("；") if part.strip()])
+        else:
+            paragraphs.append(line)
+
+    if not items and len(paragraphs) == 1 and len(paragraphs[0]) > 140:
+        pieces = re.split(r"(?<=[。！？])", paragraphs[0])
+        paragraphs = [piece.strip() for piece in pieces if piece.strip()]
+    return paragraphs[:4], items[:5]
+
+
+def normalize_report_text(text: str) -> str:
+    text = str(text or "")
+    text = re.sub(r"</?div[^>]*>", "", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("&nbsp;", " ").replace("\u3000", " ")
+    text = strip_inline_markdown(text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s*([。！？；])\s*", r"\1\n", text)
+    return text.strip()
+
+
+def clean_deepseek_report(content: str) -> str:
+    text = str(content or "").strip()
+    text = re.sub(r"^#+\s*DeepSeek\s*复核报告\s*", "", text, flags=re.I)
+    text = re.sub(r"^#+\s*亚马逊广告.*?报告\s*", "", text, flags=re.I)
+    text = re.sub(r"^(好的|收到|您好|你好)[，,。\s]*", "", text)
+    text = re.sub(r"</?div[^>]*>", "", text)
+    return text.strip()
+
+
+def split_markdown_sections(content: str) -> dict[str, str]:
+    text = clean_deepseek_report(content)
+    if not text:
+        return {}
+
+    sections: dict[str, str] = {}
+    current_title = "复核摘要"
+    current_lines: list[str] = []
+
+    def flush() -> None:
+        body = "\n".join(current_lines).strip()
+        if body:
+            sections[current_title] = body
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        title = extract_markdown_heading(line)
+        if title:
+            flush()
+            current_title = title
+            current_lines = []
+            continue
+        current_lines.append(raw_line)
+    flush()
+
+    if sections:
+        return sections
+    return {"复核摘要": text}
+
+
+def extract_markdown_heading(line: str) -> str | None:
+    text = str(line or "").strip()
+    if not text:
+        return None
+    if re.match(r"^[-*•]\s+", text):
+        return None
+
+    has_heading_marker = bool(
+        re.match(r"^#{1,6}\s+", text)
+        or re.match(r"^(?:\*\*|__)?\s*\d{1,2}\s*[.、]\s*", text)
+        or re.match(r"^(?:\*\*|__).{2,60}(?:\*\*|__)\s*[:：]?$", text)
+    )
+    if not has_heading_marker:
+        return None
+
+    title = clean_section_title(text)
+    if title in {"报告", "结论"} or len(title) < 2 or len(title) > 40:
+        return None
+    return title
+
+
+def clean_section_title(text: str) -> str:
+    title = str(text or "").strip()
+    title = re.sub(r"^#{1,6}\s*", "", title)
+    title = title.strip()
+    title = re.sub(r"^(?:\*\*|__)\s*", "", title)
+    title = re.sub(r"\s*(?:\*\*|__)\s*$", "", title)
+    title = title.strip("*_` \t")
+    title = re.sub(r"^\d{1,2}\s*[.、]\s*", "", title)
+    title = title.rstrip(":：").strip()
+    return strip_inline_markdown(title)
+
+
+def strip_inline_markdown(text: str) -> str:
+    cleaned = str(text or "")
+    cleaned = cleaned.replace("**", "").replace("__", "").replace("`", "")
+    cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
+    return cleaned
 
 
 def render_status_badge(label: object, tone: str = "neutral") -> str:
@@ -743,10 +1527,29 @@ def render_action_filters(actions: pd.DataFrame) -> pd.DataFrame:
         st.info("没有动作建议。")
         return actions
     c1, c2, c3, c4 = st.columns(4)
-    priorities = c1.multiselect("优先级", sorted(actions["优先级"].dropna().unique()), default=sorted(actions["优先级"].dropna().unique()))
-    action_types = c2.multiselect("动作类型", sorted(actions["建议动作"].dropna().unique()), default=sorted(actions["建议动作"].dropna().unique()))
-    object_types = c3.multiselect("对象类型", sorted(actions["诊断层级"].dropna().unique()), default=sorted(actions["诊断层级"].dropna().unique()))
-    campaigns = c4.multiselect("广告活动", sorted(actions["Campaign Name"].dropna().astype(str).unique()))
+    priorities = c1.multiselect(
+        "优先级",
+        sorted(actions["优先级"].dropna().unique()),
+        default=sorted(actions["优先级"].dropna().unique()),
+        key="actions_priority_filter",
+    )
+    action_types = c2.multiselect(
+        "动作类型",
+        sorted(actions["建议动作"].dropna().unique()),
+        default=sorted(actions["建议动作"].dropna().unique()),
+        key="actions_type_filter",
+    )
+    object_types = c3.multiselect(
+        "对象类型",
+        sorted(actions["诊断层级"].dropna().unique()),
+        default=sorted(actions["诊断层级"].dropna().unique()),
+        key="actions_object_filter",
+    )
+    campaigns = c4.multiselect(
+        "广告活动",
+        sorted(actions["Campaign Name"].dropna().astype(str).unique()),
+        key="actions_campaign_filter",
+    )
     filtered = actions[
         actions["优先级"].isin(priorities)
         & actions["建议动作"].isin(action_types)
@@ -845,9 +1648,23 @@ def format_metric_dataframe(dataframe: pd.DataFrame):
     return display_df.style.format(metric_formatters(display_df))
 
 
-def metric_formatters(dataframe: pd.DataFrame) -> dict[str, str]:
+def format_pivot_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
+    if dataframe.empty:
+        return dataframe
+    display_df = dataframe.rename(columns=DISPLAY_NAME_MAP).copy()
+    for column in display_df.columns:
+        if column in {"CTR", "CVR", "ACOS", "点击率", "转化率", "广告成本销售比"}:
+            display_df[column] = display_df[column].apply(lambda value: format_percent(safe_float(value)))
+        elif column in {"CPC", "ROAS", "Spend", "Sales", "Budget", "平均点击花费", "广告回报率", "花费", "销售额", "预算"}:
+            display_df[column] = display_df[column].apply(lambda value: f"{safe_float(value):,.2f}")
+        elif column in {"Impressions", "Clicks", "Orders", "曝光量", "点击量", "订单量", "优先级评分", "最高优先级评分"} or str(column).endswith("数"):
+            display_df[column] = display_df[column].apply(lambda value: f"{safe_float(value):,.0f}")
+    return display_df
+
+
+def metric_formatters(dataframe: pd.DataFrame) -> dict[str, object]:
     percent_columns = {
-        column: "{:.2%}"
+        column: lambda value: format_percent(safe_float(value))
         for column in ["CTR", "CVR", "ACOS", "点击率", "转化率", "广告成本销售比"]
         if column in dataframe.columns
     }
@@ -862,6 +1679,15 @@ def metric_formatters(dataframe: pd.DataFrame) -> dict[str, str]:
         if column in dataframe.columns
     }
     return {**percent_columns, **decimal_columns, **integer_columns}
+
+
+def safe_float(value: object) -> float:
+    if pd.isna(value):
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def count_bid_down(bid_adjustments: pd.DataFrame) -> int:
@@ -911,6 +1737,13 @@ def inject_styles() -> None:
 
     st.markdown("""
     <style>
+    [data-testid="stMarkdownContainer"] h1 a,
+    [data-testid="stMarkdownContainer"] h2 a,
+    [data-testid="stMarkdownContainer"] h3 a,
+    [data-testid="stMarkdownContainer"] h4 a,
+    a.anchor-link {
+        display: none !important;
+    }
     [data-testid="stFileUploaderDropzoneInstructions"] {
         display: none !important;
     }

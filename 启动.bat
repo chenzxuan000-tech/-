@@ -44,11 +44,11 @@ if not exist ".venv\.installed" (
 echo.
 echo ================================================
 echo   🚀 启动中，浏览器将自动打开...
-echo   如未打开，访问: http://localhost:8501
+echo   如未打开，访问: http://localhost:8502
 echo   按 Ctrl+C 停止
 echo ================================================
 echo.
 
-start http://localhost:8501
-streamlit run app.py --server.headless true --browser.gatherUsageStats false
+start http://localhost:8502
+streamlit run app.py --server.port 8502 --server.headless true --browser.gatherUsageStats false
 pause
